@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  axis-proxy:
+    build: .
+    container_name: axis_onvif_proxy
+    restart: unless-stopped
+    ports:
+      - "8080:8080" # Maps local port 8080 to container port 8080
+    environment:
+      - CAMERA_IP=192.168.1.50   # CHANGE THIS to your Axis Camera IP
+      - CAMERA_PORT=80
+      - CAMERA_USER=root        # CHANGE THIS to your Axis username
+      - CAMERA_PASS=password    # CHANGE THIS to your Axis password
+    # Optional: If you want to connect it directly to your Frigate network
+    # networks:
+    #   - frigate_net
+
+# networks:
+#   frigate_net:
+#     external: true
