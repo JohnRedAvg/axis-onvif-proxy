@@ -18,10 +18,12 @@ if CAMERA_IP == "192.168.1.50" and CAMERA_PASS == "password":
 
 # ---------------------
 TARGET_URL = f"http://{CAMERA_IP}:{CAMERA_PORT}"
+AXIS_MAX_ZOOM = 0.545454  # Default fallback max zoom limit for Axis cameras. Will be updated dynamically.
 
 @app.route('/', defaults={'path': ''}, methods=['GET', 'POST'])
 @app.route('/<path:path>', methods=['GET', 'POST'])
 def onvif_proxy(path):
+    global AXIS_MAX_ZOOM
     # 1. Forward Frigate's incoming request to the real camera
     # Handle root path correctly if path is empty
     if not path:
@@ -32,13 +34,28 @@ def onvif_proxy(path):
     # Strip the 'Host' header so the requests library sets it correctly for the camera
     headers = {key: value for (key, value) in request.headers if key.lower() != 'host'}
     
+    # NEW: Intercept AbsoluteMove requests from Frigate to clamp zoom.
+    # Frigate has a bug where it requests zoom=1.0 during calibration regardless of the camera's actual max limit.
+    request_data = request.get_data()
+    if b'AbsoluteMove' in request_data:
+        request_text = request_data.decode('utf-8', errors='ignore')
+        # We find <*Position> ... <*Zoom x="VALUE" ... />
+        match = re.search(r'(<[^:]*:?Position>.*?<[^:]*:?Zoom[^>]*x=")([\d\.]+)(")', request_text, re.DOTALL)
+        if match:
+            requested_zoom = float(match.group(2))
+            if requested_zoom > AXIS_MAX_ZOOM:
+                request_text = request_text[:match.start(2)] + str(AXIS_MAX_ZOOM) + request_text[match.end(2):]
+                request_data = request_text.encode('utf-8')
+                if 'Content-Length' in headers:
+                    headers['Content-Length'] = str(len(request_data))
+
     try:
         # We use HTTPDigestAuth as Axis usually requires Digest authentication for ONVIF
         cam_response = requests.request(
             method=request.method,
             url=camera_url,
             headers=headers,
-            data=request.get_data(),
+            data=request_data,
             auth=requests.auth.HTTPDigestAuth(CAMERA_USER, CAMERA_PASS),
             timeout=5
         )
@@ -55,7 +72,7 @@ def onvif_proxy(path):
             # Uses regex to find the capabilities tag and insert the MoveStatus flag
             # Note: tptz might have a namespace prefix or not, depending on camera
             content = re.sub(
-                r'(<[^:]*:?Capabilities[^>]*)>', 
+                r'(<(?:tptz:|tt:)?Capabilities[^>]*)>', 
                 r'\1 MoveStatus="true">', 
                 content
             )
@@ -89,6 +106,23 @@ def onvif_proxy(path):
                  content = content.replace('</tt:PTZStatus>', f'{fake_move_status_tt}</tt:PTZStatus>')
 
     # 4. Return the spoofed XML back to Frigate
+    
+    # NEW: Parse the camera's max zoom limit from profile configurations to robustly cap Zoom requests later.
+    if "GetProfilesResponse" in content or "GetNodesResponse" in content:
+        zoom_limits_match = re.search(r'<[^:]*:?ZoomLimits>.*?<[^:]*:?Max>([\d\.]+)</[^:]*:?Max>', content, re.DOTALL)
+        if zoom_limits_match:
+            AXIS_MAX_ZOOM = float(zoom_limits_match.group(1))
+
+    # NEW: Rewrite the camera's IP/port to the proxy's Host so Frigate doesn't bypass the proxy.
+    # request.host contains the IP/port Frigate used to connect to the proxy (e.g. "192.168.1.36:8180")
+    # request.host is robust but sometimes XAddr uses http://IP/ or http://IP:PORT/
+    # We will use regex to safely replace the exact camera IP and port with the proxy host.
+    content = re.sub(
+        r'http://' + re.escape(CAMERA_IP) + r'(?::' + re.escape(str(CAMERA_PORT)) + r')?([^a-zA-Z0-9.:])',
+        r'http://' + request.host + r'\1',
+        content
+    )
+
     # We pass along the original status code and headers, but with our modified body
     excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
     proxy_headers = [
